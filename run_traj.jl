@@ -84,6 +84,7 @@ function integrate_bidirectional(
     LagrangianERA5.TrajectoryModule.interpolate_along_trajectory!(traj, extra_itps, vars)
     LagrangianERA5.TrajectoryModule.compute_rhi!(traj)
     LagrangianERA5.TrajectoryModule.compute_potential_temperature!(traj)
+    LagrangianERA5.TrajectoryModule.compute_adiabatic_dTdt!(traj)
     LagrangianERA5.TrajectoryModule.compute_time_derivative!(traj, :t, :dTdt)
     LagrangianERA5.TrajectoryModule.compute_time_derivative!(traj, :q, :dqdt)
     LagrangianERA5.TrajectoryModule.compute_curvature!(traj)
@@ -96,16 +97,22 @@ end
 function trajectory_to_df(traj::LagrangianERA5.TrajectoryModule.Trajectory)
     N = length(traj.time)
 
-    z = length(traj.z) == N ? traj.z : fill(NaN, N)
-
-    # core trajectory information
     df = DataFrame(
         traj_id = fill(traj.id, N),
+
         time    = traj.time,
         lon     = traj.lon,
         lat     = traj.lat,
         p       = traj.p,
-        z       = z
+
+        z       = traj.z,
+        gh      = traj.gh,
+
+        t       = traj.t,
+        u       = traj.u,
+        v       = traj.v,
+        w       = traj.w,
+        q       = traj.q,
     )
 
     # extras (vectors only)
@@ -168,13 +175,13 @@ start_time = DateTime(2019,1,3)
 end_time   = DateTime(2019,1,3)
 n_time     = 1
 
-lon_min   = -30.0
-lon_max   = -30.0
-lon_steps = 1
+lon_min   = -50.0
+lon_max   = -10.0
+lon_steps = 30
 
-lat_min   = 45.0
-lat_max   = 45.0
-lat_steps = 1
+lat_min   = 35.0
+lat_max   = 65.0
+lat_steps = 30
 
 pressure_level = 25000.0
 
