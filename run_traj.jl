@@ -3,6 +3,34 @@ using Dates, CSV, DataFrames, DimensionalData, Tables
 
 using LagrangianERA5
 
+function round_to_nearest_hour(t::DateTime)
+    minute_offset = Minute(minute(t))
+    second_offset = Second(second(t))
+
+    t0 = t - minute_offset - second_offset
+
+    if minute(t) ≥ 30
+        return t0 + Hour(1)
+    else
+        return t0
+    end
+end
+
+function storm_relative_polar(lat, lon, lat_s, lon_s)
+
+    # Great circle distance
+    r = LagrangianERA5.PressureSystems.haversine_km(lat, lon, lat_s, lon_s)
+
+    # Local Cartesian approximation
+    dx = (lon - lon_s) * cosd(lat_s)
+    dy = (lat - lat_s)
+
+    θ = atan(dy, dx)   # radians
+
+    return r, θ
+end
+
+
 function build_itps(interp_dict)
     itps = Dict{DateTime, Tuple{Any,Any,Any}}()
     for t in keys(interp_dict[:u])
@@ -80,8 +108,8 @@ function integrate_bidirectional(
     traj = LagrangianERA5.TrajectoryModule.Trajectory(traj_id, time_comb, lon_comb, lat_comb, p_comb)
 
     # compute extra quantities along trajectory
-    LagrangianERA5.TrajectoryModule.compute_geopotential_height!(traj)
     LagrangianERA5.TrajectoryModule.interpolate_along_trajectory!(traj, extra_itps, vars)
+    LagrangianERA5.TrajectoryModule.compute_geopotential_height!(traj)
     LagrangianERA5.TrajectoryModule.compute_rhi!(traj)
     LagrangianERA5.TrajectoryModule.compute_potential_temperature!(traj)
     LagrangianERA5.TrajectoryModule.compute_adiabatic_dTdt!(traj)
@@ -89,8 +117,82 @@ function integrate_bidirectional(
     LagrangianERA5.TrajectoryModule.compute_time_derivative!(traj, :q, :dqdt)
     LagrangianERA5.TrajectoryModule.compute_curvature!(traj)
     LagrangianERA5.TrajectoryModule.compute_cold_point!(traj)
+    LagrangianERA5.TrajectoryModule.compute_wind_vector!(traj)
 
     return traj
+
+end
+
+function formation_stats(traj::LagrangianERA5.TrajectoryModule.Trajectory, i_start::Int)
+
+    window = (i_start - 18):(i_start - 1)
+    tsec = [(Dates.value(t - traj.time[1])) / 1000.0 for t in traj.time]
+
+    q0 = traj.q[window[1]]
+    dq = traj.q[window[end]] - q0
+    M  = dq / q0
+
+    dq_si = traj.extras[:q_si][window[end]] - traj.extras[:q_si][window[1]]
+    saturation_control = abs(dq) / (abs(dq) + abs(dq_si))
+
+ 
+    T_avg  = LagrangianERA5.TrajectoryModule.mean(traj.t[window])
+    dT     = traj.t[window[end]] - traj.t[window[1]]
+    dtheta = traj.extras[:potential_t][window[end]] - traj.extras[:potential_t][window[1]]
+    dT_adiab = sum(traj.extras[:dTdt_adiab][window]) * LagrangianERA5.TrajectoryModule.mean(diff(tsec[window]))
+
+    T = - 2.5e6 / (461.5 * T_avg ^ 2) * (dT)
+
+    ascent = sum(max.(traj.w[window], 0.0)) * LagrangianERA5.TrajectoryModule.mean(diff(tsec[window]))
+
+
+
+    return (
+        M = M,
+        T = T,
+        T_avg = T_avg,
+        dT = dT,
+        dT_adiab = dT_adiab,
+        dtheta = dtheta,
+        saturation_control = saturation_control,
+        integrated_ascent = ascent
+    )
+
+    return 
+
+end
+
+function extract_issrs(traj::LagrangianERA5.TrajectoryModule.Trajectory)
+
+    issr_bounds = LagrangianERA5.ISSRModule.detect_issrs(traj.extras[:rhi])
+    events = Vector{LagrangianERA5.ISSRModule.ISSREvent}()
+
+    for (k, (i_start, i_end)) in enumerate(issr_bounds)
+
+        duration = i_end - i_start + 1
+        mean_rhi = LagrangianERA5.TrajectoryModule.mean(traj.extras[:rhi][i_start:i_end])
+        max_rhi  = maximum(traj.extras[:rhi][i_start:i_end])
+
+        has_window = i_start > 18
+
+        recent_event = any(prev_end >= i_start - 18 for (_, prev_end) in issr_bounds[1:k-1])
+
+        if has_window
+            stats = formation_stats(traj, i_start)
+            push!(events, LagrangianERA5.ISSRModule.ISSREvent(
+                traj.id, k, i_start, i_end, traj.time[i_start], traj.time[i_end], mean_rhi, max_rhi, true, recent_event,
+                stats.M, stats.T, stats.T_avg, stats.dT, stats.dT_adiab, stats.dtheta, stats.saturation_control, stats.integrated_ascent
+            ))
+        else
+            push!(events, LagrangianERA5.ISSRModule.ISSREvent(
+                traj.id, k, i_start, i_end, traj.time[i_start], traj.time[i_end], mean_rhi, max_rhi, false, recent_event,
+                missing, missing, missing, missing, missing, missing, missing, missing
+            ))
+        end
+
+    end
+
+    return events
 
 end
 
@@ -146,6 +248,90 @@ function trajectory_to_metadata(traj::LagrangianERA5.TrajectoryModule.Trajectory
     return DataFrame(row)
 end
 
+function tracks_to_dataframe(tracks)
+
+    rows = []
+
+    for tr in tracks
+        for i in eachindex(tr.times)
+            push!(rows, (
+                storm_id = tr.id,
+                time     = tr.times[i],
+                lat      = tr.lats[i],
+                lon      = tr.lons[i]
+            ))
+        end
+    end
+
+    return DataFrame(rows)
+end
+
+function lows_to_dataframe(lows)
+
+    DataFrame(
+        time = [low.time for low in lows],
+        lat  = [low.lat  for low in lows],
+        lon  = [low.lon  for low in lows]
+    )
+end
+
+function attach_storm_influence!(
+    traj::LagrangianERA5.TrajectoryModule.Trajectory,
+    storm_by_time,
+    R_INFLUENCE
+)
+
+    n = length(traj.time)
+
+    storm_id  = fill(-1, n)
+    storm_r   = fill(NaN, n)
+    storm_theta = fill(NaN, n)
+    in_storm  = falses(n)
+
+    for i in 1:n
+
+        t_hour = round_to_nearest_hour(traj.time[i])
+
+        storms = get(storm_by_time, t_hour, nothing)
+        storms === nothing && continue
+
+        best_r = Inf
+        best_sid = -1
+        best_theta = NaN
+
+        for (sid, lat_s, lon_s) in storms
+
+            r, θ = storm_relative_polar(
+                traj.lat[i],
+                traj.lon[i],
+                lat_s,
+                lon_s
+            )
+
+            if r < best_r
+                best_r = r
+                best_sid = sid
+                best_theta = θ
+            end
+        end
+
+        if best_r ≤ R_INFLUENCE
+            storm_id[i]   = best_sid
+            storm_r[i]    = best_r
+            storm_theta[i] = best_theta
+            in_storm[i]   = true
+        end
+    end
+
+    traj.extras["storm_id"] = storm_id
+    traj.extras["storm_r_km"] = storm_r
+    traj.extras["storm_theta_rad"] = storm_theta
+    traj.extras["in_storm"] = in_storm
+
+    return nothing
+end
+
+
 println("Lagrangian IceSupersaturated Tool (LIST)")
 println("----------------------------------------\n")
 
@@ -153,7 +339,7 @@ println("----------------------------------------\n")
 
 # Full set
 
-"""start_time = DateTime(2019,1,3)
+start_time = DateTime(2019,1,3)
 end_time   = DateTime(2019,1,8)
 n_time     = 31
 
@@ -167,11 +353,11 @@ lat_steps = 30
 
 pressure_level = 25000.0
 
-vars = [:u, :v, :w, :t, :q, :pv, :d]"""
+vars = [:u, :v, :w, :t, :q, :d, :z]
 
 # Reduced set for testing
 
-start_time = DateTime(2019,1,3)
+"""start_time = DateTime(2019,1,3)
 end_time   = DateTime(2019,1,3)
 n_time     = 1
 
@@ -185,7 +371,7 @@ lat_steps = 30
 
 pressure_level = 25000.0
 
-vars = [:u, :v, :w, :t, :q, :z]
+vars = [:u, :v, :w, :t, :q, :z]"""
 
 ###### GENERATE GRIDS ######
 
@@ -209,6 +395,33 @@ ps_da = LagrangianERA5.GeoData.load_surface_range(dates; datadir=datadir)
 end
 
 println("(time taken = $(round(t, digits=2)) s)")
+
+##### PRESSURE SYSTEMS #######
+
+print("Resolving weather systems... ")
+
+t = @elapsed begin 
+lows = LagrangianERA5.PressureSystems.detect_lows(ps_da)
+lows = LagrangianERA5.PressureSystems.cluster_lows(lows, 150.0)
+storms = LagrangianERA5.PressureSystems.track_storms(lows)
+
+df = tracks_to_dataframe(storms)
+df_lows = lows_to_dataframe(lows)
+
+storm_by_time = Dict{DateTime, Vector{Tuple{Int,Float64,Float64}}}()
+
+for tr in storms
+    for i in eachindex(tr.times)
+        te = tr.times[i]
+        push!(
+            get!(storm_by_time, te, Tuple{Int,Float64,Float64}[]),
+            (tr.id, tr.lats[i], tr.lons[i])
+        )
+    end
+end
+end
+println("(time taken = $(round(t, digits=2)) s)")
+
 
 ##### BUILD INTERPOLATORS ######
 
@@ -235,6 +448,7 @@ print("Integrating Trajectories...  ")
 
 t = @elapsed begin
 trajectories = Vector{LagrangianERA5.TrajectoryModule.Trajectory}()
+all_events   = Vector{LagrangianERA5.ISSRModule.ISSREvent}()
 
 for (traj_id, x0) in initial_conditions
     # x0 may be (lon,lat,p) or (lon,lat,p,start_time)
@@ -247,9 +461,14 @@ for (traj_id, x0) in initial_conditions
         local_start_idx = start_idx
     end
 
-    traj = integrate_bidirectional(traj_id, x0_pos, times, itps, local_start_idx;
-                                   extra_itps=extra_itps, vars=vars)
+    traj   = integrate_bidirectional(traj_id, x0_pos, times, itps, local_start_idx;
+                                     extra_itps=extra_itps, vars=vars)
+    events = extract_issrs(traj)
+
+    attach_storm_influence!(traj, storm_by_time, 2000)
+
     push!(trajectories, traj)
+    append!(all_events, events)
 end
 
 end
@@ -264,9 +483,11 @@ metadata = trajectory_to_metadata.(trajectories)
     
 ensemble_df = vcat(dfs...; cols=:union)
 metadata_df = vcat(metadata...; cols=:union)
+all_events_df = DataFrame(Tables.columntable(all_events))
 
 CSV.write("ensemble.csv", ensemble_df)
 CSV.write("ensemble_metadata.csv", metadata_df)
+CSV.write("all_events.csv", all_events_df)
 
 end
 println("(time taken = $(round(t, digits=2)) s)")
