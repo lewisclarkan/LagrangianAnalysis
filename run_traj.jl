@@ -30,7 +30,6 @@ function storm_relative_polar(lat, lon, lat_s, lon_s)
     return r, θ
 end
 
-
 function build_itps(interp_dict)
     itps = Dict{DateTime, Tuple{Any,Any,Any}}()
     for t in keys(interp_dict[:u])
@@ -268,18 +267,28 @@ end
 
 function lows_to_dataframe(lows)
 
-    DataFrame(
-        time = [low.time for low in lows],
-        lat  = [low.lat  for low in lows],
-        lon  = [low.lon  for low in lows]
-    )
+    rows = Vector{NamedTuple}()
+
+    for low in lows
+
+        n_vertices = length(low.contour_x)
+
+        for k in 1:n_vertices
+
+            push!(rows, (
+                time = low.time,
+                low_id = low.id,
+                vertex_id = k,
+                lon = low.contour_x[k],
+                lat = low.contour_y[k]
+            ))
+        end
+    end
+
+    return DataFrame(rows)
 end
 
-function attach_storm_influence!(
-    traj::LagrangianERA5.TrajectoryModule.Trajectory,
-    storm_by_time,
-    R_INFLUENCE
-)
+function attach_storm_influence!(traj::LagrangianERA5.TrajectoryModule.Trajectory,storm_by_time,R_INFLUENCE)
 
     n = length(traj.time)
 
