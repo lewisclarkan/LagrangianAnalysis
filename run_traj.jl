@@ -265,51 +265,127 @@ function tracks_to_dataframe(tracks)
     return DataFrame(rows)
 end
 
-function lows_to_dataframe(lows)
+function system_to_dataframe(lows)
+
+    return DataFrame(
+        time = [low.time for low in lows],
+        low_id = [low.id for low in lows],
+        track_id = [low.track_id for low in lows],
+        lat  = [low.lat  for low in lows],
+        lon  = [low.lon  for low in lows]
+    )
+end
+
+function basin_to_dataframe(lows)
 
     rows = Vector{NamedTuple}()
 
     for low in lows
 
-        n_vertices = length(low.contour_x)
+        polygon = low.edge
+        polygon === nothing && continue
 
-        for k in 1:n_vertices
+        for (k, (lon, lat)) in enumerate(polygon)
 
             push!(rows, (
-                time = low.time,
-                low_id = low.id,
-                vertex_id = k,
-                lon = low.contour_x[k],
-                lat = low.contour_y[k]
+                time        = low.time,
+                low_id      = low.id,
+                vertex_id   = k,
+                lon         = lon,
+                lat         = lat
             ))
+
         end
     end
 
     return DataFrame(rows)
 end
 
-function attach_storm_influence!(traj::LagrangianERA5.TrajectoryModule.Trajectory,storm_by_time,R_INFLUENCE)
+function build_storm_center_lookup(systems::Vector{LagrangianERA5.PressureSystems.PressureSystem})
+
+    lookup = Dict{DateTime, Dict{Int,Tuple{Float64,Float64}}}()
+
+    for sys in systems
+
+        t = sys.time
+        tid = sys.track_id
+
+        inner = get!(lookup, t, Dict{Int,Tuple{Float64,Float64}}())
+        inner[tid] = (sys.lat, sys.lon)
+    end
+
+    return lookup
+end
+
+
+function storm_relative_polar(lat_p, lon_p, lat_s, lon_s)
+
+    # distance
+    r = LagrangianERA5.PressureSystems.haversine_km(lat_p, lon_p, lat_s, lon_s)
+
+    # bearing
+    φ1 = deg2rad(lat_s)
+    φ2 = deg2rad(lat_p)
+    Δλ = deg2rad(lon_p - lon_s)
+
+    y = sin(Δλ) * cos(φ2)
+    x = cos(φ1)*sin(φ2) - sin(φ1)*cos(φ2)*cos(Δλ)
+
+    θ = atan(y, x)   # radians
+
+    return r, θ
+end
+
+
+function attach_roi_influence!(
+    traj::LagrangianERA5.TrajectoryModule.Trajectory,
+    rois_by_time::Dict{DateTime,Vector{LagrangianERA5.PressureSystems.ROI}},
+    storm_center_by_time::Dict{DateTime,Dict{Int,Tuple{Float64,Float64}}},
+    storm_type::Dict{Int,Symbol})
 
     n = length(traj.time)
 
-    storm_id  = fill(-1, n)
-    storm_r   = fill(NaN, n)
+    storm_id   = fill(-1, n)
+    storm_r    = fill(NaN, n)
     storm_theta = fill(NaN, n)
-    in_storm  = falses(n)
+    in_storm   = falses(n)
+    in_low     = falses(n)
+    in_high    = falses(n)
+
+    current_hour = DateTime(0)
+    current_rois = LagrangianERA5.PressureSystems.ROI[]
+    current_centers = Dict{Int,Tuple{Float64,Float64}}()
 
     for i in 1:n
 
-        t_hour = round_to_nearest_hour(traj.time[i])
+        # ---- causal hourly snap ----
+        t_hour = floor(traj.time[i], Dates.Hour)
 
-        storms = get(storm_by_time, t_hour, nothing)
-        storms === nothing && continue
+        if t_hour != current_hour
+            current_hour = t_hour
+            current_rois = get(rois_by_time, t_hour, LagrangianERA5.PressureSystems.ROI[])
+            current_centers = get(storm_center_by_time, t_hour,
+                                  Dict{Int,Tuple{Float64,Float64}}())
+        end
 
-        best_r = Inf
-        best_sid = -1
-        best_theta = NaN
+        isempty(current_rois) && continue
 
-        for (sid, lat_s, lon_s) in storms
+        # ---- ROI membership ----
+        roi = LagrangianERA5.PressureSystems.find_roi_membership(
+            traj.lon[i],
+            traj.lat[i],
+            current_rois
+        )
 
+        if roi !== nothing
+
+            storm_id[i] = roi
+            in_storm[i] = true
+
+            # ---- centre lookup ----
+            lat_s, lon_s = current_centers[roi]
+
+            # ---- polar coordinates ----
             r, θ = storm_relative_polar(
                 traj.lat[i],
                 traj.lon[i],
@@ -317,18 +393,17 @@ function attach_storm_influence!(traj::LagrangianERA5.TrajectoryModule.Trajector
                 lon_s
             )
 
-            if r < best_r
-                best_r = r
-                best_sid = sid
-                best_theta = θ
-            end
-        end
+            storm_r[i] = r
+            storm_theta[i] = θ
 
-        if best_r ≤ R_INFLUENCE
-            storm_id[i]   = best_sid
-            storm_r[i]    = best_r
-            storm_theta[i] = best_theta
-            in_storm[i]   = true
+            # ---- storm type ----
+            type = storm_type[roi]
+
+            if type == :low
+                in_low[i] = true
+            elseif type == :high
+                in_high[i] = true
+            end
         end
     end
 
@@ -336,13 +411,14 @@ function attach_storm_influence!(traj::LagrangianERA5.TrajectoryModule.Trajector
     traj.extras["storm_r_km"] = storm_r
     traj.extras["storm_theta_rad"] = storm_theta
     traj.extras["in_storm"] = in_storm
+    traj.extras["in_low"]   = in_low
+    traj.extras["in_high"]  = in_high
 
     return nothing
 end
 
 
-println("Lagrangian IceSupersaturated Tool (LIST)")
-println("----------------------------------------\n")
+
 
 ########## CONFIG ##########
 
@@ -382,6 +458,10 @@ pressure_level = 25000.0
 
 vars = [:u, :v, :w, :t, :q, :z]"""
 
+println("Lagrangian IceSupersaturated Tool (LIST)")
+println("----------------------------------------")
+println("Program start time: $(Dates.format(now(), "HH:MM:SS"))\n")
+
 ###### GENERATE GRIDS ######
 
 ics = LagrangianERA5.Experiments.generate_grid_ic(
@@ -407,27 +487,24 @@ println("(time taken = $(round(t, digits=2)) s)")
 
 ##### PRESSURE SYSTEMS #######
 
-print("Resolving weather systems... ")
+print("Resolving pressure systems...")
 
 t = @elapsed begin 
-lows = LagrangianERA5.PressureSystems.detect_lows(ps_da)
-lows = LagrangianERA5.PressureSystems.cluster_lows(lows, 150.0)
-storms = LagrangianERA5.PressureSystems.track_storms(lows)
 
-df = tracks_to_dataframe(storms)
-df_lows = lows_to_dataframe(lows)
+lows = LagrangianERA5.PressureSystems.detect_systems(ps_da; mode=:low, threshold=1500.0)
+highs = LagrangianERA5.PressureSystems.detect_systems(ps_da; mode=:high, threshold=1200.0)
 
-storm_by_time = Dict{DateTime, Vector{Tuple{Int,Float64,Float64}}}()
+low_tracks = LagrangianERA5.PressureSystems.track_systems(lows; kind=:low)
+high_tracks = LagrangianERA5.PressureSystems.track_systems(highs, kind=:high)
 
-for tr in storms
-    for i in eachindex(tr.times)
-        te = tr.times[i]
-        push!(
-            get!(storm_by_time, te, Tuple{Int,Float64,Float64}[]),
-            (tr.id, tr.lats[i], tr.lons[i])
-        )
-    end
-end
+systems = vcat(lows, highs)
+
+rois = LagrangianERA5.PressureSystems.build_rois(systems)
+rois_by_time = LagrangianERA5.PressureSystems.group_lows_by_time(rois)
+
+storm_type = Dict(sys.track_id => sys.type for sys in systems)
+storm_center_by_time = build_storm_center_lookup(systems)
+
 end
 println("(time taken = $(round(t, digits=2)) s)")
 
@@ -474,11 +551,17 @@ for (traj_id, x0) in initial_conditions
                                      extra_itps=extra_itps, vars=vars)
     events = extract_issrs(traj)
 
-    attach_storm_influence!(traj, storm_by_time, 2000)
+    attach_roi_influence!(
+        traj,
+        rois_by_time,
+        storm_center_by_time,
+        storm_type
+    )
 
     push!(trajectories, traj)
     append!(all_events, events)
 end
+
 
 end
 println("(time taken = $(round(t, digits=2)) s)")
@@ -493,6 +576,24 @@ metadata = trajectory_to_metadata.(trajectories)
 ensemble_df = vcat(dfs...; cols=:union)
 metadata_df = vcat(metadata...; cols=:union)
 all_events_df = DataFrame(Tables.columntable(all_events))
+
+df_lows  = system_to_dataframe(lows)
+df_highs = system_to_dataframe(highs)
+
+df_basin_lows  = basin_to_dataframe(lows)
+df_basin_highs = basin_to_dataframe(highs)
+
+df_low_tracks = tracks_to_dataframe(low_tracks)
+df_high_tracks = tracks_to_dataframe(high_tracks)
+
+CSV.write("pressure_lows.csv", df_lows)
+CSV.write("pressure_highs.csv", df_highs)
+
+CSV.write("lows_basins.csv", df_basin_lows)
+CSV.write("highs_basins.csv", df_basin_highs)
+
+CSV.write("low_tracks.csv", df_low_tracks)
+CSV.write("high_tracks.csv", df_high_tracks)
 
 CSV.write("ensemble.csv", ensemble_df)
 CSV.write("ensemble_metadata.csv", metadata_df)
